@@ -1,0 +1,47 @@
+# Environment
+.env
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Models (downloaded at runtime)
+*.pt
+*.pth
+*.bin
+*.safetensors
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Streamlit
+.streamlit/
+
+# Temp files
+*.tmp
+*.temp
+
+# Test outputs
+tests/sample_ads/*.json
+tests/sample_ads/*.mp4
+tests/sample_ads/*.wav
+
+# Large files
+*.mp4
+*.mov
+*.avi
+*.mkv
+!tests/sample_ads/test.jpg

@@ -1,0 +1,44 @@
+# Ad Intelligence Pipeline — Dependencies
+
+# Core
+streamlit>=1.45.0
+pydantic>=2.11.0
+python-dotenv>=1.1.0
+
+# OCR
+easyocr>=1.7.0
+
+# Object Detection
+ultralytics>=8.3.0
+
+# Scene Description (BLIP local)
+transformers>=4.52.0
+torch>=2.6.0
+Pillow>=11.0.0
+
+# Color Analysis
+opencv-python-headless>=4.11.0
+scikit-learn>=1.6.0
+numpy>=1.26.0
+
+# Audio Transcription
+openai-whisper>=20240930
+
+# Video Frame Extraction (CLIP)
+open-clip-torch>=2.29.0
+
+# Video Scene Detection (fallback)
+scenedetect[opencv]>=0.6.5
+
+# YouTube Download
+yt-dlp>=2025.1.0
+
+# Language Detection
+langdetect>=1.0.9
+
+# LLM APIs
+groq>=0.25.0
+google-genai>=1.14.0
+
+# HTTP
+requests>=2.32.0
