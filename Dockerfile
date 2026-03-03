@@ -15,6 +15,10 @@ RUN curl -fsSL https://deno.land/install.sh | sh && \
 
 WORKDIR /app
 
+# Set environment for lightweight mode
+ENV RENDER=true
+ENV LIGHTWEIGHT_MODE=light
+
 # Copy requirements first (Docker cache layer)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
