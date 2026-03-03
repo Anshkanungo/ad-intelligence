@@ -220,10 +220,17 @@ class AdIntelligencePipeline:
     def _run_video(self, media_info, start_time, errors, modules_used, progress, lightweight):
         """Video pipeline: CLIP frames → optional OCR → Whisper → VLM."""
 
-        # Step 2: Extract key frames with CLIP
-        progress(2, 8, "Extracting key frames (CLIP)...")
-        frame_mod = self._get_module("frames")
-        frame_result = self._safe_run("frames", lambda: frame_mod.extract(media_info.temp_path), errors) if frame_mod else None
+        # Step 2: Extract key frames
+        if lightweight:
+            # Skip CLIP — use simple interval sampling (no model needed)
+            progress(2, 8, "Extracting key frames (interval sampling)...")
+            frame_result = self._extract_frames_simple(media_info.temp_path, errors)
+        else:
+            # Full mode — use CLIP embedding-based selection
+            progress(2, 8, "Extracting key frames (CLIP)...")
+            frame_mod = self._get_module("frames")
+            frame_result = self._safe_run("frames", lambda: frame_mod.extract(media_info.temp_path), errors) if frame_mod else None
+
         if frame_result: modules_used.append("frames")
 
         # Step 3: Audio extraction + transcription
@@ -385,6 +392,165 @@ class AdIntelligencePipeline:
             msg = f"{name} failed: {str(e)}"
             logger.error(msg)
             errors.append(msg)
+            return None
+
+    def _extract_frames_simple(self, video_path: str, errors: list) -> dict | None:
+        """
+        Lightweight frame extraction — no ML models.
+        Uses multi-signal fingerprinting: color histogram + structural hash + edge density.
+        Catches scene changes like CLIP but with zero RAM overhead.
+        """
+        try:
+            import cv2
+            import numpy as np
+
+            cap = cv2.VideoCapture(video_path)
+            if not cap.isOpened():
+                return None
+
+            fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            duration = round(total_frames / fps, 2) if fps > 0 else 0
+
+            # Sample at 1 FPS
+            sample_interval = max(1, int(fps))
+
+            def get_fingerprint(frame):
+                """Compute lightweight multi-signal fingerprint for a frame."""
+                small = cv2.resize(frame, (160, 90))  # Tiny for speed
+
+                # Signal 1: Color histogram (HSV, 8 bins per channel)
+                hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+                hist_h = cv2.calcHist([hsv], [0], None, [8], [0, 180]).flatten()
+                hist_s = cv2.calcHist([hsv], [1], None, [8], [0, 256]).flatten()
+                hist_v = cv2.calcHist([hsv], [2], None, [8], [0, 256]).flatten()
+                color_hist = np.concatenate([hist_h, hist_s, hist_v])
+                color_hist = color_hist / (color_hist.sum() + 1e-8)  # Normalize
+
+                # Signal 2: Structural hash (4x4 grid mean brightness)
+                gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+                h, w = gray.shape
+                grid = []
+                gh, gw = h // 4, w // 4
+                for r in range(4):
+                    for c in range(4):
+                        cell = gray[r*gh:(r+1)*gh, c*gw:(c+1)*gw]
+                        grid.append(float(np.mean(cell)) / 255.0)
+                structure = np.array(grid)
+
+                # Signal 3: Edge density
+                edges = cv2.Canny(gray, 100, 200)
+                edge_density = float(np.sum(edges > 0)) / (h * w)
+
+                return color_hist, structure, edge_density
+
+            def compute_change(fp1, fp2):
+                """Compute weighted change score between two fingerprints."""
+                hist1, struct1, edge1 = fp1
+                hist2, struct2, edge2 = fp2
+
+                # Color histogram similarity (cosine)
+                dot = np.dot(hist1, hist2)
+                norm = (np.linalg.norm(hist1) * np.linalg.norm(hist2)) + 1e-8
+                color_sim = dot / norm
+
+                # Structural similarity (1 - normalized euclidean)
+                struct_dist = np.linalg.norm(struct1 - struct2)
+                struct_sim = max(0, 1.0 - struct_dist / 2.0)
+
+                # Edge delta
+                edge_delta = abs(edge1 - edge2)
+
+                # Weighted combined score (lower = more different)
+                similarity = (0.6 * color_sim) + (0.3 * struct_sim) + (0.1 * (1.0 - min(edge_delta * 10, 1.0)))
+
+                return similarity
+
+            # Pass 1: Sample frames at 1 FPS and compute fingerprints
+            sampled = []  # (frame_num, frame, fingerprint)
+            frame_num = 0
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                if frame_num % sample_interval == 0:
+                    fp = get_fingerprint(frame)
+                    sampled.append((frame_num, frame.copy(), fp))
+                frame_num += 1
+
+            if not sampled:
+                cap.release()
+                return None
+
+            logger.info(f"Sampled {len(sampled)} frames at 1 FPS")
+
+            # Pass 2: Select frames with significant change
+            threshold = 0.88  # Below this similarity = new scene
+            selected_indices = [0]  # Always include first frame
+            prev_fp = sampled[0][2]
+
+            for i in range(1, len(sampled)):
+                sim = compute_change(prev_fp, sampled[i][2])
+                if sim < threshold:
+                    selected_indices.append(i)
+                    prev_fp = sampled[i][2]
+
+            # Always include last frame (brand/logo reveal)
+            last_idx = len(sampled) - 1
+            if last_idx not in selected_indices:
+                selected_indices.append(last_idx)
+
+            # Also include frame with highest edge density (most text)
+            edge_densities = [s[2][2] for s in sampled]  # edge_density from fingerprint
+            max_edge_idx = int(np.argmax(edge_densities))
+            if max_edge_idx not in selected_indices:
+                selected_indices.append(max_edge_idx)
+
+            selected_indices = sorted(set(selected_indices))
+
+            # Cap at 10 frames max to keep VLM costs reasonable
+            if len(selected_indices) > 10:
+                step = len(selected_indices) // 10
+                keep = [selected_indices[i] for i in range(0, len(selected_indices), step)][:10]
+                # Ensure first and last are always included
+                if selected_indices[0] not in keep:
+                    keep[0] = selected_indices[0]
+                if selected_indices[-1] not in keep:
+                    keep[-1] = selected_indices[-1]
+                selected_indices = sorted(set(keep))
+
+            # Build output
+            frames = []
+            for idx in selected_indices:
+                fn, frame, fp = sampled[idx]
+                frames.append({
+                    "image": frame,
+                    "timestamp_sec": round(fn / fps, 2),
+                    "scene_index": len(frames),
+                })
+
+            cap.release()
+
+            logger.info(
+                f"Fingerprint selection: {len(frames)} key frames from "
+                f"{len(sampled)} sampled (threshold={threshold})"
+            )
+
+            return {
+                "frames": frames,
+                "frame_count": len(frames),
+                "scene_count": len(frames),
+                "duration_seconds": duration,
+                "fps": fps,
+                "resolution": f"{width}x{height}",
+                "method": "fingerprint",
+            }
+
+        except Exception as e:
+            errors.append(f"Frame extraction failed: {e}")
+            logger.error(f"Fingerprint frame extraction failed: {e}")
             return None
 
     def _run_llm(self, context, errors, image=None, images=None):
