@@ -233,20 +233,24 @@ class AdIntelligencePipeline:
 
         if frame_result: modules_used.append("frames")
 
-        # Step 3: Audio extraction + transcription
-        progress(3, 8, "Transcribing audio...")
+        # Step 3: Audio — skip Whisper in lightweight mode (saves ~300MB RAM)
+        progress(3, 8, "Processing audio...")
         transcription_result = None
-        audio_mod = self._get_module("audio_extract")
-        audio_result = self._safe_run("audio_extract", lambda: audio_mod.extract(media_info.temp_path), errors) if audio_mod else None
 
-        if audio_result and audio_result.get("has_audio"):
-            modules_used.append("audio_extract")
-            whisper_mod = self._get_module("whisper")
-            if whisper_mod:
-                transcription_result = self._safe_run("whisper", lambda: whisper_mod.transcribe(audio_result["audio_path"]), errors)
-                if transcription_result: modules_used.append("whisper")
-            if audio_result.get("audio_path"):
-                audio_mod.cleanup(audio_result["audio_path"])
+        if not lightweight:
+            audio_mod = self._get_module("audio_extract")
+            audio_result = self._safe_run("audio_extract", lambda: audio_mod.extract(media_info.temp_path), errors) if audio_mod else None
+
+            if audio_result and audio_result.get("has_audio"):
+                modules_used.append("audio_extract")
+                whisper_mod = self._get_module("whisper")
+                if whisper_mod:
+                    transcription_result = self._safe_run("whisper", lambda: whisper_mod.transcribe(audio_result["audio_path"]), errors)
+                    if transcription_result: modules_used.append("whisper")
+                if audio_result.get("audio_path"):
+                    audio_mod.cleanup(audio_result["audio_path"])
+        else:
+            progress(3, 8, "Skipping audio transcription (cloud mode)...")
 
         # Step 4: Collect frames for VLM
         progress(4, 8, "Preparing frames for AI analysis...")
@@ -398,11 +402,13 @@ class AdIntelligencePipeline:
         """
         Lightweight frame extraction — no ML models.
         Uses multi-signal fingerprinting: color histogram + structural hash + edge density.
-        Catches scene changes like CLIP but with zero RAM overhead.
+        If codec isn't supported, re-encodes to H.264 first via FFmpeg.
         """
         try:
             import cv2
             import numpy as np
+            import subprocess
+            import tempfile
 
             cap = cv2.VideoCapture(video_path)
             if not cap.isOpened():
@@ -413,6 +419,40 @@ class AdIntelligencePipeline:
             width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             duration = round(total_frames / fps, 2) if fps > 0 else 0
+
+            # Test if we can actually read a frame
+            ret, test_frame = cap.read()
+            cap.release()
+
+            if not ret or test_frame is None:
+                # Codec not supported — re-encode to H.264
+                logger.warning("Cannot read frames (codec issue). Re-encoding to H.264...")
+                tmp_h264 = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4", prefix="ad_h264_").name
+                try:
+                    result = subprocess.run(
+                        ["ffmpeg", "-i", video_path, "-c:v", "libx264", "-c:a", "aac",
+                         "-preset", "ultrafast", "-y", tmp_h264],
+                        capture_output=True, text=True, timeout=60,
+                    )
+                    if result.returncode == 0:
+                        video_path = tmp_h264
+                        cap = cv2.VideoCapture(video_path)
+                        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+                        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                        duration = round(total_frames / fps, 2) if fps > 0 else 0
+                        cap.release()
+                        logger.info(f"Re-encoded to H.264: {width}x{height}, {duration}s")
+                    else:
+                        logger.error(f"Re-encoding failed: {result.stderr[-200:]}")
+                        return None
+                except Exception as e:
+                    logger.error(f"Re-encoding error: {e}")
+                    return None
+            
+            # Now extract frames
+            cap = cv2.VideoCapture(video_path)
 
             # Sample at 1 FPS
             sample_interval = max(1, int(fps))

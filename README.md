@@ -102,7 +102,7 @@ curl -fsSL https://deno.land/install.sh | sh
 
 ```bash
 # Best quality up to 1080p (recommended)
-yt-dlp -f "bestvideo[height<=1080]+bestaudio" --merge-output-format mp4 -o "my_ad.mp4" "https://www.youtube.com/watch?v=VIDEO_ID"
+yt-dlp -f "bestvideo[vcodec^=avc1][height<=1080]+bestaudio" --merge-output-format mp4 -o test_h264.mp4 "https://www.youtube.com/watch?v=VIDEO_ID"
 
 # Quick download (auto selects best)
 yt-dlp -o "my_ad.mp4" "https://www.youtube.com/watch?v=VIDEO_ID"

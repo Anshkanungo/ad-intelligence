@@ -1,33 +1,22 @@
-# Ad Intelligence Pipeline — Dependencies
+# Ad Intelligence Pipeline — Dependencies (Cloud / Lightweight)
+# Heavy ML models (torch, whisper, CLIP, BLIP, etc.) are LOCAL ONLY.
+# Cloud mode uses only VLM APIs + OpenCV for frame extraction.
 
 # Core
 streamlit>=1.45.0
 pydantic>=2.11.0
 python-dotenv>=1.1.0
 
-# Image processing
+# Image processing (needed for frame extraction + color analysis)
 Pillow>=11.0.0
 opencv-python-headless>=4.11.0
 numpy>=1.26.0
-
-# Color Analysis (lightweight, no heavy model)
 scikit-learn>=1.6.0
 
-# PyTorch CPU-only (much smaller footprint)
---extra-index-url https://download.pytorch.org/whl/cpu
-torch
-torchvision
-
-# CLIP for frame selection (video)
-open-clip-torch>=2.29.0
-
-# Audio Transcription
-openai-whisper>=20240930
-
-# Language Detection
+# Language Detection (tiny, no ML model)
 langdetect>=1.0.9
 
-# LLM APIs
+# LLM APIs (the actual brain — all processing happens remotely)
 groq>=0.25.0
 google-genai>=1.14.0
 
@@ -36,12 +25,6 @@ yt-dlp>=2025.1.0
 
 # HTTP
 requests>=2.32.0
-
-# OCR (used in full mode only, lazy loaded)
-easyocr>=1.7.0
-
-# Video scene detection (fallback)
-scenedetect[opencv]>=0.6.5
 
 # RAM detection
 psutil>=6.0.0
