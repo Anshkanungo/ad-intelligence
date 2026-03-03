@@ -72,6 +72,23 @@ def _download_video(url: str):
         import shutil
         ffmpeg_path = shutil.which("ffmpeg")
         
+        # Hardcoded fallback for Windows winget install
+        if not ffmpeg_path:
+            import glob
+            winget_paths = glob.glob(r"C:\Users\*\AppData\Local\Microsoft\WinGet\Links\ffmpeg.exe")
+            if winget_paths:
+                ffmpeg_path = winget_paths[0]
+        if not ffmpeg_path:
+            # Check common install locations
+            for candidate in [
+                r"C:\ffmpeg\bin\ffmpeg.exe",
+                r"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
+                r"C:\ProgramData\chocolatey\bin\ffmpeg.exe",
+            ]:
+                if os.path.exists(candidate):
+                    ffmpeg_path = candidate
+                    break
+        
         # yt-dlp command: download best video+audio up to 1080p, merge with ffmpeg
         cmd = [
             "yt-dlp",
@@ -196,6 +213,7 @@ with input_tab2:
         "Paste YouTube or video URL",
         placeholder="https://www.youtube.com/watch?v=...",
     )
+    st.caption("⚠️ YouTube URLs may not work on cloud hosting due to authentication. If download fails, please download the video manually and use the Upload tab.")
     if video_url and st.button("⬇️ Download Video"):
         with st.spinner("Downloading video..."):
             downloaded = _download_video(video_url)

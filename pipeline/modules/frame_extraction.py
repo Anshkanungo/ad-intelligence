@@ -147,8 +147,9 @@ class FrameExtractionModule:
                 frames = self._clip_extract(video_path, fps, total_frames)
                 result["method"] = "clip"
             else:
-                frames = self._interval_sample(video_path, fps, total_frames)
-                result["method"] = "interval"
+                logger.info("CLIP not available, using interval + edge detection fallback")
+                frames = self._smart_interval_sample(video_path, fps, total_frames)
+                result["method"] = "interval_smart"
 
             result["frames"] = frames
             result["frame_count"] = len(frames)
@@ -287,6 +288,80 @@ class FrameExtractionModule:
                 })
 
         cap.release()
+        return frames
+
+    def _smart_interval_sample(self, video_path: str, fps: float, total_frames: int) -> list[dict]:
+        """
+        Lightweight fallback: sample at 1 FPS, use histogram comparison
+        to detect scene changes. No ML model needed — pure OpenCV.
+        Always includes first frame, last frame, and most text-dense frame.
+        """
+        sample_interval = max(1, int(fps))  # 1 FPS
+        cap = cv2.VideoCapture(video_path)
+
+        all_sampled = []
+        frame_num = 0
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            if frame_num % sample_interval == 0:
+                all_sampled.append((frame_num, frame.copy()))
+            frame_num += 1
+        cap.release()
+
+        if not all_sampled:
+            return []
+
+        logger.info(f"Sampled {len(all_sampled)} frames at 1 FPS (histogram method)")
+
+        # Compute histogram for each frame
+        histograms = []
+        for fn, frame in all_sampled:
+            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+            hist = cv2.calcHist([hsv], [0, 1], None, [50, 60], [0, 180, 0, 256])
+            cv2.normalize(hist, hist)
+            histograms.append(hist)
+
+        # Select frames with significant histogram change
+        selected = [0]  # Always first frame
+        threshold = 0.4  # Lower = more sensitive (correlation: 1.0 = identical)
+
+        for i in range(1, len(all_sampled)):
+            similarity = cv2.compareHist(histograms[i - 1], histograms[i], cv2.HISTCMP_CORREL)
+            if similarity < threshold:
+                selected.append(i)
+
+        # Always include last frame
+        last_idx = len(all_sampled) - 1
+        if last_idx not in selected:
+            selected.append(last_idx)
+
+        # Add most text-dense frame (edge detection proxy)
+        edge_scores = []
+        for fn, frame in all_sampled:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            edges = cv2.Canny(gray, 100, 200)
+            edge_scores.append(int(np.sum(edges > 0)))
+
+        max_edge_idx = int(np.argmax(edge_scores))
+        if max_edge_idx not in selected:
+            selected.append(max_edge_idx)
+
+        selected = sorted(set(selected))
+
+        # Build output
+        frames = []
+        for idx in selected:
+            fn, frame = all_sampled[idx]
+            timestamp = round(fn / fps, 2)
+            frames.append({
+                "image": frame,
+                "timestamp_sec": timestamp,
+                "scene_index": len(frames),
+            })
+
+        logger.info(f"Histogram selected {len(frames)} key frames from {len(all_sampled)} sampled")
         return frames
 
 
