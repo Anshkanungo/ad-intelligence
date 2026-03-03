@@ -3,14 +3,15 @@ FROM python:3.11-slim
 # System dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
-    libgl1-mesa-glx \
+    libgl1 \
     libglib2.0-0 \
-    deno \
+    curl \
+    unzip \
     && rm -rf /var/lib/apt/lists/*
 
-# If deno not available from apt, install manually
-RUN which deno || (curl -fsSL https://deno.land/install.sh | sh && \
-    ln -s /root/.deno/bin/deno /usr/local/bin/deno) || true
+# Install Deno (required by yt-dlp for YouTube)
+RUN curl -fsSL https://deno.land/install.sh | sh && \
+    ln -s /root/.deno/bin/deno /usr/local/bin/deno
 
 WORKDIR /app
 
