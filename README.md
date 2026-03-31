@@ -42,6 +42,42 @@ Upload any ad and get a **fixed 13-section JSON** with:
 
 ---
 
+## 📊 Example Output
+
+For a 15-second OCA Energy Drink video ad:
+
+```json
+{
+  "brand": {
+    "company_name": "OCA",
+    "logo_detected": true,
+    "logo_description": "Stylized 'OCA' logo with tropical leaf motifs"
+  },
+  "product": {
+    "product_name": "Energy Drink",
+    "product_category": "Beverages",
+    "product_description": "Plant-based energy drink in Berry Açai, Guava Passion Fruit, and Mango",
+    "product_features": ["Plant-based", "Organic", "USDA Organic certified"]
+  },
+  "text_content": {
+    "tagline": "TUDO BEM! (it's all good)",
+    "subheadline": "PLANT-BASED ENERGY DRINK",
+    "body_copy": "Made with real fruit extracts, we deliver natural energy that lasts."
+  },
+  "classification": {
+    "industry": "Beverages",
+    "target_audience": "Health-conscious consumers, Young adults",
+    "tone": "Positive, Energetic, Refreshing",
+    "themes": ["Health", "Natural ingredients", "Energy", "Fruit flavors"]
+  }
+}
+```
+
+*(Truncated — full output has 13 sections with 100+ fields)*
+
+---
+
+
 ## 🏗️ Architecture
 
 ```
@@ -276,41 +312,6 @@ The pipeline includes a built-in ad database powered by Qdrant:
 - **Hybrid** — combine semantic queries with exact filters for precise results
 
 The search layer uses `all-MiniLM-L6-v2` embeddings (384-dim, CPU-friendly) for semantic matching, with indexed payload fields for O(1) exact filtering.
-
----
-
-## 📊 Example Output
-
-For a 15-second OCA Energy Drink video ad:
-
-```json
-{
-  "brand": {
-    "company_name": "OCA",
-    "logo_detected": true,
-    "logo_description": "Stylized 'OCA' logo with tropical leaf motifs"
-  },
-  "product": {
-    "product_name": "Energy Drink",
-    "product_category": "Beverages",
-    "product_description": "Plant-based energy drink in Berry Açai, Guava Passion Fruit, and Mango",
-    "product_features": ["Plant-based", "Organic", "USDA Organic certified"]
-  },
-  "text_content": {
-    "tagline": "TUDO BEM! (it's all good)",
-    "subheadline": "PLANT-BASED ENERGY DRINK",
-    "body_copy": "Made with real fruit extracts, we deliver natural energy that lasts."
-  },
-  "classification": {
-    "industry": "Beverages",
-    "target_audience": "Health-conscious consumers, Young adults",
-    "tone": "Positive, Energetic, Refreshing",
-    "themes": ["Health", "Natural ingredients", "Energy", "Fruit flavors"]
-  }
-}
-```
-
-*(Truncated — full output has 13 sections with 100+ fields)*
 
 ---
 
