@@ -176,6 +176,19 @@ class VideoAnalysis(BaseModel):
 
 
 # ──────────────────────────────────────────────
+# Section 9: video_analysis — Video-specific
+# ──────────────────────────────────────────────
+
+class VideoAnalysis(BaseModel):
+    duration_seconds: float = 0.0
+    scene_count: int = 0
+    scenes: list[VideoScene] = Field(default_factory=list)
+    has_subtitles: bool = False
+    transition_styles: list[str] = Field(default_factory=list)
+    pacing: str = ""
+
+
+# ──────────────────────────────────────────────
 # Section 10: classification — Ad categorization
 # ──────────────────────────────────────────────
 
@@ -286,9 +299,42 @@ def get_schema_json_template() -> str:
 def validate_output(data: dict) -> tuple[bool, AdIntelligenceOutput | None, str]:
     """
     Validate a dict against the schema.
+    Pre-cleans common LLM mistakes before validation.
     Returns (is_valid, parsed_model_or_None, error_message).
     """
     try:
+        # Pre-clean: fix scenes returned as strings
+        if "video_analysis" in data and "scenes" in data["video_analysis"]:
+            cleaned_scenes = []
+            for s in data["video_analysis"]["scenes"]:
+                if isinstance(s, str):
+                    cleaned_scenes.append({"description": s, "timestamp_start": "", "timestamp_end": ""})
+                elif isinstance(s, dict):
+                    cleaned_scenes.append(s)
+                else:
+                    cleaned_scenes.append({"description": str(s), "timestamp_start": "", "timestamp_end": ""})
+            data["video_analysis"]["scenes"] = cleaned_scenes
+
+        # Pre-clean: fix people_description returned as list
+        if "visual_analysis" in data:
+            va = data["visual_analysis"]
+            if isinstance(va.get("people_description"), list):
+                va["people_description"] = ", ".join(str(p) for p in va["people_description"])
+            if isinstance(va.get("objects_detected"), str):
+                va["objects_detected"] = [va["objects_detected"]]
+
+        # Pre-clean: fix any list fields that got strings
+        for section_name in ["text_content", "brand", "classification", "engagement_elements"]:
+            if section_name in data:
+                section = data[section_name]
+                for key, val in section.items():
+                    if isinstance(val, str) and key in [
+                        "hashtags", "all_raw_text", "brand_colors_hex", "brand_social_handles",
+                        "product_features", "themes", "urgency_elements", "transition_styles",
+                        "sound_effects", "secondary_languages", "dominant_colors_hex", "objects_detected"
+                    ]:
+                        section[key] = [v.strip() for v in val.split(",") if v.strip()]
+
         model = AdIntelligenceOutput.model_validate(data)
         return True, model, ""
     except Exception as e:

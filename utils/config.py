@@ -60,7 +60,7 @@ class PipelineConfig:
     # ── Video Processing ──
     max_keyframes: int = 20                 # Max frames fallback (interval mode)
     max_video_duration: int = 300           # 5 min max (seconds)
-    clip_similarity_threshold: float = 0.85 # Below this = significant change (0-1)
+    clip_similarity_threshold: float = 0.50 # Below this = significant change (0-1)
 
     # ── File Limits ──
     max_image_size_mb: int = 20

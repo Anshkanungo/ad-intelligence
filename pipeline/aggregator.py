@@ -1,13 +1,13 @@
 """
 Ad Intelligence Pipeline — Signal Aggregator
 
-Merges outputs from all extraction modules into a single context blob
-that gets fed to the LLM reasoning engine.
+Merges outputs from extraction modules + VLM descriptions into a single
+context string for the LLM reasoning engine.
 
 Usage:
     from pipeline.aggregator import SignalAggregator
     aggregator = SignalAggregator()
-    context = aggregator.merge(ocr_result, yolo_result, color_result, ...)
+    context = aggregator.merge(media_type="image", vlm_description=desc, ...)
 """
 
 from utils.logger import get_logger
@@ -29,17 +29,27 @@ class SignalAggregator:
         transcription_result: dict | None = None,
         frame_results: list[dict] | None = None,
         video_info: dict | None = None,
+        vlm_description: str | None = None,
     ) -> str:
         """
         Merge all module outputs into a structured context string.
 
+        Args:
+            vlm_description: Text output from local VLM (describe_frame or
+                            multi-frame descriptions). Replaces OCR + BLIP.
+
         Returns a formatted string that the LLM can reason over.
         """
         sections = []
-        sections.append(f"=== AD ANALYSIS SIGNALS ===")
+        sections.append("=== AD ANALYSIS SIGNALS ===")
         sections.append(f"Media Type: {media_type.upper()}")
 
-        # ── OCR Text ──
+        # ── VLM Description (primary signal — replaces OCR + BLIP) ──
+        if vlm_description:
+            sections.append("\n--- VLM VISUAL ANALYSIS ---")
+            sections.append(vlm_description)
+
+        # ── OCR Text (legacy / supplementary) ──
         if ocr_result and ocr_result.get("text_count", 0) > 0:
             sections.append("\n--- OCR EXTRACTED TEXT ---")
             sections.append(f"Total text fragments: {ocr_result['text_count']}")
@@ -48,9 +58,6 @@ class SignalAggregator:
             for item in ocr_result.get("text_with_positions", []):
                 sections.append(f"  - \"{item['text']}\" (confidence: {item['confidence']})")
             sections.append(f"Combined text: {ocr_result.get('full_text', '')}")
-        else:
-            sections.append("\n--- OCR EXTRACTED TEXT ---")
-            sections.append("No text detected by OCR.")
 
         # ── Object Detection ──
         if yolo_result and yolo_result.get("total_objects", 0) > 0:
@@ -58,9 +65,6 @@ class SignalAggregator:
             sections.append(f"Objects found: {yolo_result['objects']}")
             sections.append(f"Counts: {yolo_result['object_counts']}")
             sections.append(f"People detected: {yolo_result['people_detected']} (count: {yolo_result['people_count']})")
-        else:
-            sections.append("\n--- OBJECT DETECTION ---")
-            sections.append("No standard objects detected (ad may use stylized/graphic design elements).")
 
         # ── Color Analysis ──
         if color_result and color_result.get("dominant_colors_hex"):
@@ -73,9 +77,9 @@ class SignalAggregator:
                 for cp in color_result["color_percentages"][:4]:
                     sections.append(f"  {cp['hex']}: {cp['percentage']}%")
 
-        # ── Scene Description (BLIP) ──
-        if scene_result and scene_result.get("caption"):
-            sections.append("\n--- SCENE DESCRIPTION (AI Vision) ---")
+        # ── Scene Description (BLIP — legacy, only if no VLM description) ──
+        if scene_result and scene_result.get("caption") and not vlm_description:
+            sections.append("\n--- SCENE DESCRIPTION (BLIP) ---")
             sections.append(f"Caption: {scene_result['caption']}")
             if scene_result.get("ad_content"):
                 sections.append(f"Ad content: {scene_result['ad_content']}")
@@ -111,7 +115,7 @@ class SignalAggregator:
             sections.append(f"FPS: {video_info.get('fps', 0)}")
             sections.append(f"Scenes/frames analyzed: {video_info.get('frame_count', 0)}")
 
-        # ── Per-frame analysis for video ──
+        # ── Per-frame analysis (legacy) ──
         if frame_results:
             sections.append("\n--- PER-FRAME ANALYSIS ---")
             for i, fr in enumerate(frame_results):
@@ -130,10 +134,6 @@ class SignalAggregator:
         return context
 
 
-# ══════════════════════════════════════════════
-# QUICK TEST
-# ══════════════════════════════════════════════
-
 if __name__ == "__main__":
     print("=" * 50)
     print("Signal Aggregator — Quick Test")
@@ -141,19 +141,19 @@ if __name__ == "__main__":
 
     agg = SignalAggregator()
 
-    # Simulate module outputs
+    # Test with VLM description (new flow)
     context = agg.merge(
         media_type="image",
-        ocr_result={
-            "raw_texts": ["BUY NOW", "+123-456-789"],
-            "text_with_positions": [
-                {"text": "BUY NOW", "bbox": [], "confidence": 0.95},
-                {"text": "+123-456-789", "bbox": [], "confidence": 0.88},
-            ],
-            "full_text": "BUY NOW | +123-456-789",
-            "avg_confidence": 0.915,
-            "text_count": 2,
-        },
+        vlm_description=(
+            "TEXT: QUICK SALE PROMO | NEW SEASON | NEW STYLE | NEW COLLECTION | "
+            "HURRY UP 70% FOR ALL ITEM! | +123-456-789-98 | YOURWEBSITE.COM | @YOURSTORENAME | BUY NOW!\n"
+            "BRAND: [Not visible]\n"
+            "PRODUCT: [New Season Collection of Shoes]\n"
+            "PEOPLE: [Not visible]\n"
+            "OBJECTS: [Shoe with laces and text overlay]\n"
+            "SETTING: [Dark background with abstract shapes]\n"
+            "COLORS: [Black, white, grey, orange]"
+        ),
         color_result={
             "dominant_colors_hex": ["#0c0b0a", "#ff5722"],
             "color_percentages": [
@@ -163,13 +163,6 @@ if __name__ == "__main__":
             "color_mood": "Dark/Dramatic",
             "brightness": "Dark",
             "saturation": "Muted",
-        },
-        scene_result={
-            "caption": "a flyer for a shoe sale",
-            "ad_content": "promoting nike shoes",
-            "setting": "dark background studio",
-            "people": "",
-            "mood": "bold and energetic",
         },
         language_result={
             "primary_language": "en",

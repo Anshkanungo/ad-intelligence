@@ -1,385 +1,649 @@
 """
-Ad Intelligence Pipeline — Streamlit UI
-Upload any ad (image, video, audio) → Get structured JSON analysis.
+Ad Intelligence — Streamlit App
+
+Tabs:
+  1. Analyze — Upload video/image → pipeline → JSON → optionally store in vector DB
+  2. Search  — Filter + semantic search across stored ads
+
+Run: streamlit run app.py
 """
 
+import io
 import json
+import time
+import base64
+import tempfile
+import torch
 import streamlit as st
 from pathlib import Path
+from PIL import Image
 
-from pipeline.orchestrator import AdIntelligencePipeline
 from utils.config import config
+from utils.logger import get_logger
 
-# ══════════════════════════════════════════════
-# PAGE CONFIG
-# ══════════════════════════════════════════════
+logger = get_logger(__name__)
 
-st.set_page_config(
-    page_title="Ad Intelligence Pipeline",
-    page_icon="🎯",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+st.set_page_config(page_title="Ad Intelligence", page_icon="📊", layout="wide")
 
-# ══════════════════════════════════════════════
-# CUSTOM CSS
-# ══════════════════════════════════════════════
-
-st.markdown("""
-<style>
-    .main-header {
-        font-size: 2.2rem;
-        font-weight: 700;
-        background: linear-gradient(90deg, #FF6B6B, #4ECDC4);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-        margin-bottom: 0;
-    }
-    .sub-header {
-        color: #888;
-        font-size: 1.1rem;
-        margin-top: 0;
-    }
-    .metric-card {
-        background: #1E1E1E;
-        border-radius: 10px;
-        padding: 15px;
-        border: 1px solid #333;
-    }
-    .stDownloadButton > button {
-        width: 100%;
-    }
-</style>
-""", unsafe_allow_html=True)
+VIDEO_EXTENSIONS = ["mp4", "mov", "avi", "webm", "mkv"]
+IMAGE_EXTENSIONS = ["jpg", "jpeg", "png", "webp"]
 
 
-# ══════════════════════════════════════════════
-# VIDEO URL DOWNLOAD HELPER
-# ══════════════════════════════════════════════
+# ═══════════════════════════════════════════
+# VECTOR STORE (cached singleton)
+# ═══════════════════════════════════════════
 
-def _download_video(url: str):
-    """Download video from YouTube/URL using yt-dlp. Returns a file-like object."""
-    import tempfile
-    import subprocess
-    import os
+@st.cache_resource
+def get_vector_store():
+    """Load vector store once, reuse across reruns."""
+    from pipeline.vector_store import AdVectorStore
+    return AdVectorStore()
+
+
+# ═══════════════════════════════════════════
+# HELPERS
+# ═══════════════════════════════════════════
+
+def save_temp_video(uploaded_file) -> str:
+    """Save uploaded video to temp file, return path."""
+    suffix = Path(uploaded_file.name).suffix
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    tmp.write(uploaded_file.read())
+    tmp.flush()
+    uploaded_file.seek(0)
+    return tmp.name
+
+
+def encode_image(pil_img: Image.Image) -> str:
+    """Encode PIL image to base64 JPEG for Groq."""
+    if max(pil_img.size) > 1024:
+        pil_img = pil_img.copy()
+        pil_img.thumbnail((1024, 1024), Image.Resampling.LANCZOS)
+    buf = io.BytesIO()
+    pil_img.save(buf, format="JPEG", quality=85)
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+
+# ═══════════════════════════════════════════
+# VIDEO PIPELINE
+# ═══════════════════════════════════════════
+
+def run_whisper(video_path: str) -> dict:
+    """Extract audio and transcribe."""
+    from pipeline.modules.audio_extraction import AudioExtractionModule
+    from pipeline.modules.transcription import TranscriptionModule
+
+    audio_mod = AudioExtractionModule()
+    audio_result = audio_mod.extract(video_path)
+
+    if not audio_result or not audio_result.get("has_audio"):
+        return {"transcript": "", "whisper_result": None}
+
+    whisper_mod = TranscriptionModule()
+    whisper_result = whisper_mod.transcribe(audio_result["audio_path"])
+    audio_mod.cleanup(audio_result["audio_path"])
+
+    transcript = ""
+    if whisper_result and whisper_result.get("transcript"):
+        transcript = whisper_result["transcript"]
+
+    return {"transcript": transcript, "whisper_result": whisper_result}
+
+
+def run_frame_selection(video_path: str, ref_images: list[Image.Image]) -> list[dict]:
+    """CLIP smart frame selection."""
+    from pipeline.modules.frame_extraction import FrameExtractionModule
+
+    frame_mod = FrameExtractionModule()
+    result = frame_mod.extract(video_path, preview_images=ref_images or None)
+    frame_mod.unload()
+    torch.cuda.empty_cache()
+
+    if not result or not result.get("frames"):
+        return []
+
+    return result["frames"]
+
+
+def run_groq_video(
+    frames: list[dict],
+    briefing: dict,
+    ref_images: list[Image.Image],
+) -> str:
+    """Send ref image + frames + transcript to Groq for video analysis."""
+    from groq import Groq
+    from schema.ad_schema import get_schema_json_template
+    from pipeline.reasoning.prompt_builder import SYSTEM_PROMPT
+
+    transcript = briefing.get("transcript", "")
+    segments = []
+    if briefing.get("whisper_result") and briefing["whisper_result"].get("segments"):
+        segments = briefing["whisper_result"]["segments"]
+
+    frame_descs = []
+    for i, f in enumerate(frames):
+        ts = f.get("timestamp_sec", 0)
+        bucket = f.get("bucket", "unknown")
+        psim = f.get("preview_similarity", 0)
+
+        nearby_text = ""
+        for seg in segments:
+            if abs(seg["start"] - ts) < 3.0:
+                nearby_text += seg["text"] + " "
+
+        desc = f"Frame {i+1} (t={ts}s, type={bucket}, product_match={psim:.2f})"
+        if nearby_text.strip():
+            desc += f' — Audio: "{nearby_text.strip()[:150]}"'
+        frame_descs.append(desc)
+
+    context = f"""=== AD ANALYSIS SIGNALS ===
+Media Type: VIDEO
+
+--- FRAME SELECTION INFO ---
+{chr(10).join(frame_descs)}
+
+--- AUDIO TRANSCRIPTION ---
+{transcript if transcript else "No speech detected."}
+
+--- TIMESTAMPS ---
+{chr(10).join(f"[{seg['start']:.1f}s - {seg['end']:.1f}s] {seg['text']}" for seg in segments[:25]) if segments else "No segments."}
+
+=== END OF SIGNALS ==="""
+
+    schema_template = get_schema_json_template()
+    system_prompt = SYSTEM_PROMPT + "\n" + schema_template
+
+    image_list = []
+    if ref_images:
+        image_list.append("Image 1: Reference image (product/service being advertised)")
+    for i in range(len(frames)):
+        bucket = frames[i].get("bucket", "")
+        ts = frames[i].get("timestamp_sec", "?")
+        img_num = (1 if ref_images else 0) + i + 1
+        image_list.append(f"Image {img_num}: Video frame at t={ts}s ({bucket} shot)")
+
+    user_content = [
+        {"type": "text", "text": f"""Analyze this video advertisement and return the complete JSON.
+
+The attached images are:
+{chr(10).join(image_list)}
+
+{context}
+
+INSTRUCTIONS:
+1. {"The reference image shows the ACTUAL PRODUCT/SERVICE being advertised — use it to identify what's being sold." if ref_images else "No reference image provided — infer the product from the video frames and transcript."}
+2. Examine ALL video frames for text, brand logos, taglines, people, settings, and story
+3. Use the audio transcript to understand the ad's narrative and emotional tone
+4. The ad might be about a SERVICE (not just a physical product) — look at context clues
+5. Fill the video_analysis.scenes field with descriptions of what each frame shows
+6. Infer industry, target audience, tone, and themes from the complete picture
+
+Return ONLY the complete JSON object following the exact schema."""},
+    ]
+
+    if ref_images:
+        user_content.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:image/jpeg;base64,{encode_image(ref_images[0])}"},
+        })
+
+    import cv2
+    for f in frames:
+        pil_img = Image.fromarray(cv2.cvtColor(f["image"], cv2.COLOR_BGR2RGB))
+        user_content.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:image/jpeg;base64,{encode_image(pil_img)}"},
+        })
+
+    client = Groq(api_key=config.groq_api_key)
+    response = client.chat.completions.create(
+        model=config.groq_vision_model,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ],
+        temperature=0.1,
+        max_tokens=4096,
+        response_format={"type": "json_object"},
+    )
+
+    return response.choices[0].message.content
+
+
+# ═══════════════════════════════════════════
+# IMAGE PIPELINE
+# ═══════════════════════════════════════════
+
+def run_groq_image(images: list[Image.Image]) -> str:
+    """Send up to 5 images directly to Groq for static ad analysis."""
+    from groq import Groq
+    from schema.ad_schema import get_schema_json_template
+    from pipeline.reasoning.prompt_builder import SYSTEM_PROMPT
+
+    schema_template = get_schema_json_template()
+    system_prompt = SYSTEM_PROMPT + "\n" + schema_template
+
+    image_guide = "\n".join(f"Image {i+1}: Ad image" for i in range(len(images)))
+
+    user_content = [
+        {"type": "text", "text": f"""Analyze this advertisement and return the complete JSON.
+
+The attached images are:
+{image_guide}
+
+=== AD ANALYSIS SIGNALS ===
+Media Type: IMAGE
+Number of images: {len(images)}
+=== END OF SIGNALS ===
+
+INSTRUCTIONS:
+1. Read ALL visible text (brand names, product names, taglines, URLs, prices, CTAs)
+2. Identify the brand from logos and text on the product/packaging
+3. Describe the scene, people, objects, and setting
+4. Infer industry, target audience, tone, and themes
+5. If multiple images are provided, they may show different angles or variations of the same ad
+
+Return ONLY the complete JSON object following the exact schema."""},
+    ]
+
+    for img in images[:5]:
+        user_content.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:image/jpeg;base64,{encode_image(img)}"},
+        })
+
+    client = Groq(api_key=config.groq_api_key)
+    response = client.chat.completions.create(
+        model=config.groq_vision_model,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ],
+        temperature=0.1,
+        max_tokens=4096,
+        response_format={"type": "json_object"},
+    )
+
+    return response.choices[0].message.content
+
+
+# ═══════════════════════════════════════════
+# DISPLAY RESULTS + STORE OPTION
+# ═══════════════════════════════════════════
+
+def display_results(raw_json: str, elapsed: float):
+    """Parse, validate, display JSON results, and offer to store in vector DB."""
+    # Persist results in session state so they survive reruns
+    st.session_state["last_raw_json"] = raw_json
+    st.session_state["last_elapsed"] = elapsed
+    _render_results()
+
+
+def _render_results():
+    """Render results from session state (survives Streamlit reruns)."""
+    raw_json = st.session_state.get("last_raw_json")
+    elapsed = st.session_state.get("last_elapsed", 0)
+
+    if not raw_json:
+        return
+
+    st.divider()
+    st.subheader(f"Results ({elapsed:.1f}s total)")
 
     try:
-        # Create temp file for download
-        tmp_dir = tempfile.mkdtemp(prefix="ad_dl_")
-        output_path = os.path.join(tmp_dir, "video.mp4")
+        data = json.loads(raw_json)
+    except json.JSONDecodeError as e:
+        st.error(f"JSON parse error: {e}")
+        st.code(raw_json[:2000], language="json")
+        return
 
-        # Find FFmpeg path explicitly
-        import shutil
-        ffmpeg_path = shutil.which("ffmpeg")
-        
-        # Hardcoded fallback for Windows winget install
-        if not ffmpeg_path:
-            import glob
-            winget_paths = glob.glob(r"C:\Users\*\AppData\Local\Microsoft\WinGet\Links\ffmpeg.exe")
-            if winget_paths:
-                ffmpeg_path = winget_paths[0]
-        if not ffmpeg_path:
-            # Check common install locations
-            for candidate in [
-                r"C:\ffmpeg\bin\ffmpeg.exe",
-                r"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
-                r"C:\ProgramData\chocolatey\bin\ffmpeg.exe",
-            ]:
-                if os.path.exists(candidate):
-                    ffmpeg_path = candidate
-                    break
-        
-        # yt-dlp command: download best video+audio up to 1080p, merge with ffmpeg
-        cmd = [
-            "yt-dlp",
-            "--no-playlist",
-            "--format", "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
-            "--output", output_path,
-            "--merge-output-format", "mp4",
-            "--socket-timeout", "30",
-        ]
-        
-        # Tell yt-dlp where FFmpeg is
-        if ffmpeg_path:
-            ffmpeg_dir = os.path.dirname(ffmpeg_path)
-            cmd.extend(["--ffmpeg-location", ffmpeg_dir])
-        
-        cmd.append(url)
+    from schema.ad_schema import validate_output
+    is_valid, model, err = validate_output(data)
 
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    if is_valid and model:
+        st.success("Schema validation passed")
 
-        if result.returncode != 0:
-            st.error(f"Download error: {result.stderr[-300:]}")
-            return None
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric("Brand", model.brand.company_name or "—")
+            st.metric("Product", model.product.product_name or "—")
+            st.metric("Category", model.product.product_category or "—")
+            st.metric("Industry", model.classification.industry or "—")
+        with col2:
+            st.metric("Tone", model.classification.tone or "—")
+            st.metric("Objective", model.classification.ad_objective or "—")
+            st.metric("Audience", model.classification.target_audience or "—")
+            if model.text_content.tagline:
+                st.metric("Tagline", model.text_content.tagline)
 
-        # Find the actual downloaded file (yt-dlp may change extension)
-        downloaded = None
-        for f in os.listdir(tmp_dir):
-            if f.endswith((".mp4", ".webm", ".mkv")):
-                downloaded = os.path.join(tmp_dir, f)
-                break
+        if model.classification.themes:
+            st.write("**Themes:**", ", ".join(model.classification.themes))
 
-        if not downloaded or not os.path.exists(downloaded):
-            return None
+        if model.ad_description.short_summary:
+            st.write("**Summary:**", model.ad_description.short_summary)
 
-        # Create a file-like object that mimics Streamlit's UploadedFile
-        class DownloadedFile:
-            def __init__(self, path):
-                self.name = os.path.basename(path)
-                self._path = path
-                self._data = open(path, "rb").read()
-                self.size = len(self._data)
-                self._pos = 0
-
-            def read(self):
-                return self._data
-
-            def seek(self, pos):
-                self._pos = pos
-
-        return DownloadedFile(downloaded)
-
-    except subprocess.TimeoutExpired:
-        st.error("Download timed out (>2 min). Try a shorter video.")
-        return None
-    except FileNotFoundError:
-        st.error("yt-dlp not found. Install it: `pip install yt-dlp`")
-        return None
-    except Exception as e:
-        st.error(f"Download failed: {e}")
-        return None
-
-# ══════════════════════════════════════════════
-# SIDEBAR
-# ══════════════════════════════════════════════
-
-with st.sidebar:
-    st.markdown("### ⚙️ Pipeline Status")
-
-    keys = config.validate_keys()
-    st.markdown(f"**Groq LLM:** {'🟢 Ready' if keys['groq'] else '🔴 Missing'}")
-    st.markdown(f"**Gemini Fallback:** {'🟢 Ready' if keys['gemini'] else '🟡 Not set'}")
-    st.markdown(f"**HuggingFace:** {'🟢 Ready' if keys['huggingface'] else '🟡 Not set'}")
-
-    st.divider()
-
-    st.markdown("### 📋 Supported Formats")
-    st.markdown("""
-    **Images:** JPG, PNG, WebP, BMP, TIFF  
-    **Videos:** MP4, MOV, AVI, WebM, MKV  
-    **Audio:** MP3, WAV, M4A, OGG, FLAC
-    """)
-
-    st.divider()
-
-    st.markdown("### 📊 JSON Schema")
-    st.markdown("""
-    13 fixed sections, always present:  
-    `_meta` · `source` · `brand` · `product`  
-    `text_content` · `language` · `audio`  
-    `visual_analysis` · `video_analysis`  
-    `classification` · `compliance_and_legal`  
-    `engagement_elements` · `ad_description`
-    """)
-
-    st.divider()
-    st.caption("v1.0.0 · 100% Open Source")
-
-# ══════════════════════════════════════════════
-# MAIN CONTENT
-# ══════════════════════════════════════════════
-
-st.markdown('<p class="main-header">🎯 Ad Intelligence Pipeline</p>', unsafe_allow_html=True)
-st.markdown('<p class="sub-header">Upload any advertisement → Get comprehensive JSON analysis</p>', unsafe_allow_html=True)
-
-# ── Input Method ──
-input_tab1, input_tab2 = st.tabs(["📁 Upload File", "🔗 YouTube / Video URL"])
-
-uploaded_file = None
-
-with input_tab1:
-    direct_upload = st.file_uploader(
-        "Drop your ad here",
-        type=["jpg", "jpeg", "png", "webp", "bmp", "tiff", "tif",
-              "mp4", "mov", "avi", "webm", "mkv",
-              "mp3", "wav", "m4a", "ogg", "flac", "aac"],
-        help="Supports images, videos, and audio files",
-    )
-    if direct_upload:
-        uploaded_file = direct_upload
-
-with input_tab2:
-    video_url = st.text_input(
-        "Paste YouTube or video URL",
-        placeholder="https://www.youtube.com/watch?v=...",
-    )
-    st.caption("⚠️ YouTube URLs may not work on cloud hosting due to authentication. If download fails, please download the video manually and use the Upload tab.")
-    if video_url and st.button("⬇️ Download Video"):
-        with st.spinner("Downloading video..."):
-            downloaded = _download_video(video_url)
-            if downloaded:
-                st.session_state["downloaded_file"] = downloaded
-                st.success(f"Downloaded: {downloaded.name} ({round(downloaded.size / (1024*1024), 1)} MB)")
-            else:
-                st.error("Failed to download video. Check the URL and try again.")
-
-    # Use previously downloaded file
-    if "downloaded_file" in st.session_state:
-        uploaded_file = st.session_state["downloaded_file"]
-
-if uploaded_file is not None:
-    # Show file info
-    file_ext = Path(uploaded_file.name).suffix.lower()
-    media_type = config.get_media_type(uploaded_file.name)
-    file_size = getattr(uploaded_file, 'size', 0)
-    file_size_mb = round(file_size / (1024 * 1024), 2) if file_size else 0
-
-    col1, col2, col3 = st.columns(3)
-    col1.metric("File", uploaded_file.name)
-    col2.metric("Type", media_type.upper())
-    col3.metric("Size", f"{file_size_mb} MB")
-
-    # Preview
-    if media_type == "image":
-        st.image(uploaded_file, caption="Uploaded Ad", width="stretch")
-    elif media_type == "video":
-        if hasattr(uploaded_file, '_data'):
-            st.video(uploaded_file._data)
-        else:
-            st.video(uploaded_file)
-    elif media_type == "audio":
-        if hasattr(uploaded_file, '_data'):
-            st.audio(uploaded_file._data)
-        else:
-            st.audio(uploaded_file)
-
-    # Reset file position after preview
-    uploaded_file.seek(0)
-
-    # ── Run Pipeline ──
-    if st.button("🚀 Analyze Ad", type="primary"):
-
-        # Check API keys
-        if not keys["groq"] and not keys["gemini"]:
-            st.error("❌ No LLM API key configured. Set GROQ_API_KEY or GEMINI_API_KEY in .env")
-            st.stop()
-
-        # Progress bar
-        progress_bar = st.progress(0, text="Starting pipeline...")
-        status_text = st.empty()
-
-        def update_progress(step, total, message):
-            progress_bar.progress(step / total, text=message)
-            status_text.text(f"Step {step}/{total}: {message}")
-
-        # Run pipeline
-        with st.spinner(""):
-            pipeline = AdIntelligencePipeline()
-            result = pipeline.run(uploaded_file, progress_callback=update_progress)
-
-        progress_bar.progress(1.0, text="Complete!")
-        status_text.empty()
-
-        # ── Results ──
+        # --- Store in Vector DB ---
         st.divider()
-        st.markdown("## 📊 Results")
+        st.subheader("💾 Store in Ad Database")
 
-        # Metrics row
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("⏱️ Time", f"{result.meta.processing_time_sec}s")
-        m2.metric("🎯 Confidence", f"{result.meta.confidence_score:.0%}")
-        m3.metric("🔧 Modules", len(result.meta.modules_used))
-        m4.metric("⚠️ Errors", len(result.meta.errors))
-
-        # Show errors if any
-        if result.meta.errors:
-            with st.expander("⚠️ Pipeline Errors", expanded=False):
-                for err in result.meta.errors:
-                    st.warning(err)
-
-        # Key findings cards
-        st.markdown("### 🔍 Key Findings")
-
-        k1, k2 = st.columns(2)
-        with k1:
-            st.markdown("**Brand & Product**")
-            st.markdown(f"🏢 **Brand:** {result.brand.company_name or 'Not identified'}")
-            st.markdown(f"📦 **Product:** {result.product.product_name or 'Not identified'}")
-            st.markdown(f"🏷️ **Category:** {result.product.product_category or 'N/A'}")
-            st.markdown(f"💰 **Price:** {result.product.price_mentioned or 'Not mentioned'}")
-            st.markdown(f"🎁 **Offer:** {result.product.offer_or_discount or 'None'}")
-
-        with k2:
-            st.markdown("**Classification**")
-            st.markdown(f"🏭 **Industry:** {result.classification.industry or 'N/A'}")
-            st.markdown(f"🎯 **Objective:** {result.classification.ad_objective or 'N/A'}")
-            st.markdown(f"👥 **Audience:** {result.classification.target_audience or 'N/A'}")
-            st.markdown(f"🎭 **Tone:** {result.classification.tone or 'N/A'}")
-            st.markdown(f"💡 **Appeal:** {result.classification.emotional_appeal or 'N/A'}")
-
-        # Text content
-        st.markdown("### 📝 Text Content")
-        t1, t2 = st.columns(2)
-        with t1:
-            st.markdown(f"**Headline:** {result.text_content.headline or 'N/A'}")
-            st.markdown(f"**Tagline:** {result.text_content.tagline or 'N/A'}")
-            st.markdown(f"**CTA:** {result.text_content.call_to_action or 'N/A'}")
-        with t2:
-            st.markdown(f"**Body:** {result.text_content.body_copy or 'N/A'}")
-            st.markdown(f"**Contact:** {result.text_content.contact_info or 'N/A'}")
-            if result.text_content.hashtags:
-                st.markdown(f"**Hashtags:** {', '.join(result.text_content.hashtags)}")
-
-        # Ad Summary
-        st.markdown("### 📄 Ad Summary")
-        st.info(result.ad_description.short_summary or "No summary available")
-        if result.ad_description.detailed_description:
-            with st.expander("Detailed Description"):
-                st.write(result.ad_description.detailed_description)
-        if result.ad_description.creative_strategy:
-            with st.expander("Creative Strategy"):
-                st.write(result.ad_description.creative_strategy)
-
-        # Color palette
-        if result.visual_analysis.dominant_colors_hex:
-            st.markdown("### 🎨 Color Palette")
-            color_cols = st.columns(len(result.visual_analysis.dominant_colors_hex))
-            for i, color in enumerate(result.visual_analysis.dominant_colors_hex):
-                with color_cols[i]:
-                    st.markdown(
-                        f'<div style="background:{color};height:50px;border-radius:8px;'
-                        f'border:1px solid #555;"></div>'
-                        f'<p style="text-align:center;font-size:0.8rem;">{color}</p>',
-                        unsafe_allow_html=True,
-                    )
-
-        # Full JSON
-        st.markdown("### 📋 Complete JSON Output")
-
-        json_str = result.to_json(indent=2)
-
-        # Download button
-        st.download_button(
-            label="⬇️ Download JSON",
-            data=json_str,
-            file_name=f"ad_intelligence_{Path(uploaded_file.name).stem}.json",
-            mime="application/json",
+        video_link = st.text_input(
+            "Video/Ad Link (URL or identifier)",
+            placeholder="https://example.com/ad_video.mp4",
+            help="A link to retrieve this ad later. In production this would be a MongoDB ID.",
+            key="store_video_link",
         )
 
-        # JSON viewer
-        with st.expander("View Full JSON", expanded=False):
-            st.json(json.loads(json_str))
+        if st.button("Store Ad", type="secondary", key="store_ad_btn"):
+            if not video_link.strip():
+                st.warning("Please enter a video link or identifier.")
+            else:
+                store = get_vector_store()
+                ad_id = store.add_ad(data, video_link=video_link.strip())
+                st.session_state["last_store_msg"] = f"✅ Stored! ID: `{ad_id}` — Total ads in DB: {store.count()}"
 
-else:
-    # Empty state
-    st.markdown("---")
-    st.markdown(
-        """
-        <div style="text-align:center; padding:60px 0; color:#666;">
-            <h3>👆 Upload an advertisement to get started</h3>
-            <p>Supports TV ads, radio spots, YouTube ads, magazine pages, brochures, 
-            billboards, social media ads, flyers — any format!</p>
-        </div>
-        """,
-        unsafe_allow_html=True,
+        # Show store confirmation (persists across reruns)
+        if st.session_state.get("last_store_msg"):
+            st.success(st.session_state["last_store_msg"])
+
+        st.subheader("Full JSON Output")
+        st.json(data)
+    else:
+        st.error(f"Validation failed: {err}")
+        st.json(data)
+
+
+# ═══════════════════════════════════════════
+# SEARCH TAB
+# ═══════════════════════════════════════════
+
+def render_search_tab():
+    """Render the search interface for querying stored ads."""
+    store = get_vector_store()
+    ad_count = store.count()
+
+    st.header(f"🔍 Search Ad Database ({ad_count} ads)")
+
+    if ad_count == 0:
+        st.info("No ads stored yet. Go to the **Analyze** tab, process an ad, and store it.")
+        return
+
+    # --- Filters ---
+    meta = store.get_all_metadata_values()
+
+    col_search, col_filters = st.columns([2, 1])
+
+    with col_search:
+        query = st.text_input(
+            "Semantic Search",
+            placeholder="e.g., emotional family ad, running shoes, premium tech...",
+            help="Describe what you're looking for in natural language.",
+        )
+
+    with col_filters:
+        # Brand filter
+        brands = sorted(meta.get("company_name", set()))
+        selected_brand = st.selectbox("Brand", ["All"] + brands)
+
+        # Industry filter
+        industries = sorted(meta.get("industry", set()))
+        selected_industry = st.selectbox("Industry", ["All"] + industries)
+
+    # Second row of filters
+    col_f1, col_f2, col_f3 = st.columns(3)
+
+    with col_f1:
+        styles = sorted(meta.get("ad_style", set()))
+        selected_style = st.selectbox("Ad Style", ["All"] + styles)
+
+    with col_f2:
+        tones = sorted(meta.get("tone", set()))
+        selected_tone = st.selectbox("Tone", ["All"] + tones)
+
+    with col_f3:
+        categories = sorted(meta.get("product_category", set()))
+        selected_category = st.selectbox("Product Category", ["All"] + categories)
+
+    n_results = st.slider("Max results", min_value=1, max_value=50, value=10)
+
+    # --- Build filters ---
+    filters = {}
+    if selected_brand != "All":
+        filters["company_name"] = selected_brand
+    if selected_industry != "All":
+        filters["industry"] = selected_industry
+    if selected_style != "All":
+        filters["ad_style"] = selected_style
+    if selected_tone != "All":
+        filters["tone"] = selected_tone
+    if selected_category != "All":
+        filters["product_category"] = selected_category
+
+    # --- Search button ---
+    search_clicked = st.button("🔍 Search", type="primary")
+
+    if not search_clicked:
+        # Show all ads by default
+        st.caption("Click Search or adjust filters to query the database.")
+        return
+
+    # --- Execute search ---
+    t0 = time.perf_counter()
+    results = store.search(
+        query=query.strip(),
+        filters=filters if filters else None,
+        n_results=n_results,
     )
+    elapsed = time.perf_counter() - t0
+
+    st.write(f"**{len(results)} results** ({elapsed*1000:.0f}ms)")
+
+    if not results:
+        st.warning("No ads match your query and filters.")
+        return
+
+    # --- Display results ---
+    for i, r in enumerate(results):
+        p = r["payload"]
+        score = r["score"]
+
+        brand = p.get("company_name", "Unknown")
+        product = p.get("product_name", "Unknown")
+        industry = p.get("industry", "")
+        tone = p.get("tone", "")
+        style = p.get("ad_style", "")
+        summary = p.get("short_summary", "")
+        video_link = p.get("video_link", "")
+        tagline = p.get("tagline", "")
+
+        with st.expander(
+            f"**{brand}** — {product}  |  Score: {score:.3f}",
+            expanded=(i < 3),  # Auto-expand top 3
+        ):
+            col1, col2 = st.columns(2)
+            with col1:
+                st.write(f"**Industry:** {industry}")
+                st.write(f"**Style:** {style}")
+                st.write(f"**Tone:** {tone}")
+                if tagline:
+                    st.write(f"**Tagline:** {tagline}")
+            with col2:
+                st.write(f"**Audience:** {p.get('target_audience', '—')}")
+                st.write(f"**Themes:** {p.get('themes', '—')}")
+                st.write(f"**Emotional Appeal:** {p.get('emotional_appeal', '—')}")
+                st.write(f"**Objective:** {p.get('ad_objective', '—')}")
+
+            if summary:
+                st.write(f"**Summary:** {summary}")
+
+            if video_link:
+                st.write(f"**Link:** [{video_link}]({video_link})")
+
+            # Show full JSON in nested expander
+            full_json = p.get("full_json", "")
+            if full_json:
+                with st.expander("View Full JSON"):
+                    try:
+                        st.json(json.loads(full_json))
+                    except json.JSONDecodeError:
+                        st.code(full_json, language="json")
+
+
+# ═══════════════════════════════════════════
+# MAIN APP — TABS
+# ═══════════════════════════════════════════
+
+st.title("📊 Ad Intelligence")
+
+tab_analyze, tab_search = st.tabs(["🎬 Analyze", "🔍 Search"])
+
+# ── SEARCH TAB ──
+with tab_search:
+    render_search_tab()
+
+# ── ANALYZE TAB ──
+with tab_analyze:
+    st.caption("Upload a video ad, images, or both → get structured JSON analysis")
+
+    # Sidebar
+    with st.sidebar:
+        st.header("Upload")
+
+        video_file = st.file_uploader(
+            "Video Ad (optional)",
+            type=VIDEO_EXTENSIONS,
+            help="A video advertisement to analyze",
+        )
+
+        image_files = st.file_uploader(
+            "Image(s)",
+            type=IMAGE_EXTENSIONS,
+            accept_multiple_files=True,
+            help="Ad images, product shots, or reference images. For video: helps find relevant frames.",
+        )
+
+        if not config.has_groq:
+            st.error("Set GROQ_API_KEY in .env")
+
+        st.divider()
+        gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
+        st.caption(f"GPU: {gpu_name}")
+        st.caption(f"Model: {config.groq_vision_model}")
+
+        # Vector store stats
+        store = get_vector_store()
+        st.divider()
+        st.caption(f"📦 Ads in DB: {store.count()}")
+
+        has_input = video_file or image_files
+        run_button = st.button("🚀 Analyze", type="primary", disabled=not has_input or not config.has_groq)
+
+    # Nothing uploaded
+    if not video_file and not image_files:
+        st.info("Upload a video, image(s), or both in the sidebar to get started.")
+        st.stop()
+
+    # Show uploads
+    uploaded_images = []
+    if image_files:
+        for f in image_files:
+            f.seek(0)
+            uploaded_images.append(Image.open(f).convert("RGB"))
+
+    if video_file and uploaded_images:
+        col_v, col_i = st.columns([2, 1])
+        with col_v:
+            st.video(video_file)
+        with col_i:
+            st.image(uploaded_images[0], caption="Reference Image", use_container_width=True)
+            if len(uploaded_images) > 1:
+                for img in uploaded_images[1:]:
+                    st.image(img, use_container_width=True)
+    elif video_file:
+        st.video(video_file)
+        st.caption("No reference image — using scene-change detection for frame selection")
+    elif uploaded_images:
+        cols = st.columns(min(len(uploaded_images), 3))
+        for i, img in enumerate(uploaded_images):
+            with cols[i % len(cols)]:
+                st.image(img, use_container_width=True)
+
+    if not run_button:
+        # Re-render previous results if they exist (survives Store button rerun)
+        if st.session_state.get("last_raw_json"):
+            _render_results()
+        st.stop()
+
+    # Clear previous store message on new analysis
+    st.session_state.pop("last_store_msg", None)
+
+    # ═══════════════════════════════════════════
+    # PIPELINE EXECUTION
+    # ═══════════════════════════════════════════
+
+    total_t0 = time.perf_counter()
+
+    # ── MODE 1: Video ──
+    if video_file:
+        video_file.seek(0)
+        video_path = save_temp_video(video_file)
+
+        with st.status("Phase 0: Transcribing audio...", expanded=True) as status:
+            t0 = time.perf_counter()
+            briefing = run_whisper(video_path)
+            elapsed = time.perf_counter() - t0
+
+            transcript = briefing.get("transcript", "")
+            if transcript:
+                st.write(f"Transcript ({len(transcript)} chars):")
+                st.text(transcript[:500] + ("..." if len(transcript) > 500 else ""))
+            else:
+                st.write("No speech detected")
+            status.update(label=f"Phase 0: Transcription ({elapsed:.1f}s)", state="complete")
+
+        with st.status("Phase 1: Selecting key frames...", expanded=True) as status:
+            t0 = time.perf_counter()
+            frames = run_frame_selection(video_path, uploaded_images)
+            elapsed = time.perf_counter() - t0
+
+            if not frames:
+                st.error("No frames extracted — aborting")
+                st.stop()
+
+            st.write(f"Selected {len(frames)} frames:")
+            frame_cols = st.columns(len(frames))
+            import cv2
+            for i, f in enumerate(frames):
+                pil_img = Image.fromarray(cv2.cvtColor(f["image"], cv2.COLOR_BGR2RGB))
+                with frame_cols[i]:
+                    st.image(pil_img, use_container_width=True)
+                    bucket = f.get("bucket", "?")
+                    ts = f.get("timestamp_sec", "?")
+                    psim = f.get("preview_similarity", 0)
+                    st.caption(f"t={ts}s\n{bucket} | sim={psim:.2f}")
+
+            status.update(label=f"Phase 1: Frame selection ({elapsed:.1f}s)", state="complete")
+
+        with st.status("Phase 2: Groq VLM reasoning...", expanded=True) as status:
+            t0 = time.perf_counter()
+            raw_json = run_groq_video(frames, briefing, uploaded_images)
+            elapsed = time.perf_counter() - t0
+            status.update(label=f"Phase 2: Groq reasoning ({elapsed:.1f}s)", state="complete")
+
+        try:
+            Path(video_path).unlink()
+        except Exception:
+            pass
+
+        total_elapsed = time.perf_counter() - total_t0
+        display_results(raw_json, total_elapsed)
+
+    # ── MODE 2: Image only ──
+    else:
+        with st.status("Analyzing image(s) with Groq VLM...", expanded=True) as status:
+            t0 = time.perf_counter()
+            raw_json = run_groq_image(uploaded_images)
+            elapsed = time.perf_counter() - t0
+            status.update(label=f"Groq analysis ({elapsed:.1f}s)", state="complete")
+
+        total_elapsed = time.perf_counter() - total_t0
+        display_results(raw_json, total_elapsed)
